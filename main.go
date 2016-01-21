@@ -1,6 +1,7 @@
 package main
 
 import (
+    "os"
     "time"
     "errors"
     "net/http"
@@ -23,7 +24,7 @@ type Task struct {
 var db *sql.DB
 const signinChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 
-func constructTask(content string, completed string, creditcard string) (*Task, error) {
+func constructTask(content, completed, creditcard string) (*Task, error) {
     
     b := false
     if len(content) < 5 {
@@ -35,7 +36,7 @@ func constructTask(content string, completed string, creditcard string) (*Task, 
     return &Task{Content:content, Completed:b, CreditCard:creditcard}, nil
 }
 
-func getAccess(w http.ResponseWriter, r string, token string) bool {
+func getAccess(w http.ResponseWriter, r, token string) bool {
     count := db.QueryRow("SELECT COUNT(*) as count FROM perms INNER JOIN users ON users.id = perms.user_id WHERE perms.name=? AND users.token=?", r, token)
     if checkCount(count) > 0 {
         return true
@@ -65,20 +66,15 @@ func generateRandomString(n int) string {
 
 func userConnect(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
     
-    row := db.QueryRow("SELECT id FROM users WHERE name=?", r.PostFormValue("name"))
-    
     var id int
+    row := db.QueryRow("SELECT id FROM users WHERE name=?", r.PostFormValue("name"))
     if err := row.Scan(&id); err == nil {
-
         token := generateRandomString(128)
         prepareAndExec("UPDATE users set token=? WHERE id=?", token, id)
-        t, err := json.Marshal(token)
-        checkErr(err)
-        w.Write(t)
+        sendJSONResponse(w, 201, token)
     } else {
-        println(r.PostFormValue("name"))
+        sendJSONResponse(w, 401, "error: You don't have permision!")   
     }
-
 }
 
 func sendJSONResponse(w http.ResponseWriter, status int, data interface{}) {
@@ -105,6 +101,8 @@ func getTasks(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
     }
     if r.FormValue("size") != "" {
         query += " LIMIT " + r.FormValue("size")
+    } else {
+        query += " LIMIT 20"
     }
     rows, _ := db.Query(query)
     defer rows.Close()
@@ -118,7 +116,11 @@ func getTasks(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
             tasks = append(tasks, t)            
         }
 	}
-    sendJSONResponse(w, 200, tasks)
+    if len(tasks) <= 0 {
+        sendJSONResponse(w, 400, "No Task!")
+    } else {
+        sendJSONResponse(w, 200, tasks)   
+    }
 }
 
 func showTask(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
@@ -132,6 +134,7 @@ func showTask(w http.ResponseWriter, r *http.Request, params httprouter.Params) 
 
     var t Task
     if err := row.Scan(&t.ID, &t.Content, &t.Completed, &t.CreditCard); err != nil {
+        sendJSONResponse(w, 404, "Task not found!")
         return
     }
     sendJSONResponse(w, 200, t)
@@ -145,9 +148,10 @@ func createTask(w http.ResponseWriter, r *http.Request, params httprouter.Params
 
     t, err := constructTask(r.PostFormValue("content"), r.PostFormValue("completed"), r.PostFormValue("creditcard"))
     if err != nil {
-        sendJSONResponse(w, 304, err)
+        sendJSONResponse(w, 304, err.Error())
+        return
     }
-    res := prepareAndExec("INSERT INTO tasks(content, creditcard, completed) values(?,?,?)", t.Content, t.CreditCard, t.Completed)
+    res, err := prepareAndExec("INSERT INTO tasks(content, creditcard, completed) values(?,?,?)", t.Content, t.CreditCard, t.Completed)
 
     aff, err := res.RowsAffected()
     affectedResponse(w, aff, err, "created!")
@@ -161,9 +165,10 @@ func updateTask(w http.ResponseWriter, r *http.Request, params httprouter.Params
 
     t, err := constructTask(r.PostFormValue("content"), r.PostFormValue("completed"), r.PostFormValue("creditcard"))
     if err != nil {
-        sendJSONResponse(w, 304, err)
+        sendJSONResponse(w, 304, err.Error())
+        return
     }
-    res := prepareAndExec("UPDATE tasks set content=?, creditcard=?, completed=? WHERE id=?", t.Content, t.CreditCard, t.Completed, params.ByName("id"))
+    res, _ := prepareAndExec("UPDATE tasks set content=?, creditcard=?, completed=? WHERE id=?", t.Content, t.CreditCard, t.Completed, params.ByName("id"))
 
     aff, err := res.RowsAffected()
     affectedResponse(w, aff, err, "updated!")
@@ -175,7 +180,7 @@ func deleteTask(w http.ResponseWriter, r *http.Request, params httprouter.Params
         return
     }
 
-    res := prepareAndExec("DELETE FROM tasks WHERE id=?", params.ByName("id"))
+    res, _ := prepareAndExec("DELETE FROM tasks WHERE id=?", params.ByName("id"))
 
     aff, err := res.RowsAffected()
     affectedResponse(w, aff, err, "deleted!")
@@ -189,14 +194,11 @@ func affectedResponse(w http.ResponseWriter, affected int64, err error, action s
     }
 }
 
-func prepareAndExec(q string, params ...interface{}) sql.Result {
-    query, err := db.Prepare(q)
-    checkErr(err)
-
+func prepareAndExec(q string, params ...interface{}) (sql.Result, error) {
+    query, _ := db.Prepare(q)
     res, err := query.Exec(params...)
-    checkErr(err)
-    
-    return res
+
+    return res, err
 }
 
 func createRouteAndListen() {
@@ -211,6 +213,24 @@ func createRouteAndListen() {
 	http.ListenAndServe(":8000", router)
 }
 
+func initDB() {
+    db.Exec("CREATE TABLE IF NOT EXISTS `tasks` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `content` TEXT NOT NULL, `completed` BOOLEAN DEFAULT 0, `creditcard` VARCHAR(64) NOT NULL);")
+    db.Exec("CREATE TABLE IF NOT EXISTS `users` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(64) NOT NULL, `token` TEXT);")
+    db.Exec("CREATE TABLE IF NOT EXISTS `perms` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` INTEGER NOT NULL, `name` VARCHAR(64) NOT NULL);")
+    
+    db.Exec("INSERT INTO tasks(content) values(?);", "This is a task")
+    db.Exec("INSERT INTO tasks(content, completed) values(?,?);", "This is a task completed", true)
+    
+    db.Exec("INSERT INTO users(name) values(?);", "A")
+    db.Exec("INSERT INTO users(name) values(?);", "B")
+    
+    db.Exec("INSERT INTO perms(name, user_id) values(?,?);", "show", 1)
+    db.Exec("INSERT INTO perms(name, user_id) values(?,?);", "show", 2)
+    db.Exec("INSERT INTO perms(name, user_id) values(?,?);", "create", 2)
+    db.Exec("INSERT INTO perms(name, user_id) values(?,?);", "edit", 2)
+    db.Exec("INSERT INTO perms(name, user_id) values(?,?);", "delete", 2)
+}
+
 func main() {
 
     d, err := sql.Open("sqlite3", "./task.db")
@@ -218,25 +238,10 @@ func main() {
     
     if err == nil {
         db = d
-        db.Exec("CREATE TABLE IF NOT EXISTS `tasks` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `content` TEXT NOT NULL, `completed` BOOLEAN DEFAULT 0, `creditcard` VARCHAR(64) NOT NULL);")
-        db.Exec("CREATE TABLE IF NOT EXISTS `users` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(64) NOT NULL, `token` TEXT);")
-        db.Exec("CREATE TABLE IF NOT EXISTS `perms` ( `id` INTEGER PRIMARY KEY AUTOINCREMENT, `user_id` INTEGER NOT NULL, `name` VARCHAR(64) NOT NULL);")
-        
-        /*
-        db.Exec("INSERT INTO tasks(content) values(?)", "This is a task")
-        db.Exec("INSERT INTO tasks(content, completed) values(?,?)", "This is a task completed", true)
-        
-        db.Exec("INSERT INTO users(name) values(?)", "A")
-        db.Exec("INSERT INTO users(name) values(?)", "B")
-        
-        db.Exec("INSERT INTO perms(name, user_id) values(?,?)", "show", 1)
-        db.Exec("INSERT INTO perms(name, user_id) values(?,?)", "show", 2)
-        db.Exec("INSERT INTO perms(name, user_id) values(?,?)", "create", 2)
-        db.Exec("INSERT INTO perms(name, user_id) values(?,?)", "edit", 2)
-        db.Exec("INSERT INTO perms(name, user_id) values(?,?)", "delete", 2)
-        */
-
-        createRouteAndListen()    
+        if len(os.Args) > 1 && os.Args[1] == "db:init" {
+            initDB()
+        }
+        createRouteAndListen()
     }
     checkErr(err)
 }
